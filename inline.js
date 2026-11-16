@@ -76,6 +76,32 @@ export function escapeHtmlEntities(html, encode) {
   return html;
 }
 
+// The text-run pipeline (decode numeric refs, then escape) fused into a
+// single regex pass: a numeric ref decodes to a character which is then
+// escaped if it needs it, a bare & (not starting an entity) becomes &amp;,
+// and < > " ' become their entities. Named entities are left alone, exactly
+// as the two-pass pipeline does.
+const TEXT_ESCAPE = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
+const TEXT_ESCAPE_TEST = /[&<>"']/;
+export function escapeTextRun(text) {
+  if (!TEXT_ESCAPE_TEST.test(text)) return text;
+  TEXT_ESCAPE.lastIndex = 0;
+  return text.replace(TEXT_ESCAPE, (ref, dec, hex) => {
+    if (dec === undefined && hex === undefined) {
+      if (ref === '&') return '&amp;';
+      return ESCAPE_MAP[ref];
+    }
+    const code = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
+    if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\uFFFD';
+    if (code === 38) return '&amp;';
+    if (code === 60) return '&lt;';
+    if (code === 62) return '&gt;';
+    if (code === 34) return '&quot;';
+    if (code === 39) return '&#39;';
+    return String.fromCodePoint(code);
+  });
+}
+
 const NUMERIC_REF_TEST = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
 const NUMERIC_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 
@@ -892,6 +918,8 @@ function reflinkCandidate(src, i, links) {
   return { match0: src.slice(i, end), refStart: 0 };
 }
 
+const MASK_NEXT = /[\\`\[<]/g;
+
 export function maskSrc(src, links) {
   let masked = src;
   // Step 1: mask reflinks (only when definitions exist)
@@ -933,22 +961,17 @@ export function maskSrc(src, links) {
   // pass (marked does escapes+code first, then blockSkip, but the two only
   // interact where one construct contains another, and this pass handles
   // each construct as a unit in document order, so the result is the same).
-  // Jumps between the interesting characters with indexOf; the text between
-  // them is copied as one slice.
+  // Jumps between the interesting characters with one regex scan; the text
+  // between them is copied as one slice.
   {
     const parts = [];
     let i = 0;
     const n = masked.length;
+    MASK_NEXT.lastIndex = 0;
     while (i < n) {
-      let next = n;
-      const bs = masked.indexOf('\\', i);
-      if (bs !== -1 && bs < next) next = bs;
-      const bt = masked.indexOf('`', i);
-      if (bt !== -1 && bt < next) next = bt;
-      const br = masked.indexOf('[', i);
-      if (br !== -1 && br < next) next = br;
-      const lt = masked.indexOf('<', i);
-      if (lt !== -1 && lt < next) next = lt;
+      MASK_NEXT.lastIndex = i;
+      const m = MASK_NEXT.exec(masked);
+      const next = m === null ? n : m.index;
       if (next === n) { parts.push(masked.slice(i)); break; }
       if (next > i) parts.push(masked.slice(i, next));
       i = next;
@@ -1289,6 +1312,10 @@ function scanBr(src, i) {
 // or an email address (at an email-character boundary). One C++ scan
 // replaces a per-character JavaScript loop.
 const TEXT_STOP = /[\\<!\[`*_~]| {2,}\n|(?<![^\s*_~(])www\.|[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|(?<![A-Za-z0-9])(?:mailto:|xmpp:)|[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@/g;
+// The same stops minus the autolink lookaheads, for runs that contain no
+// url indicator at all (no www., ://, @, mailto:, xmpp:): much cheaper to
+// run, and the result is identical there.
+const TEXT_STOP_SIMPLE = /[\\<!\[`*_~]| {2,}\n/g;
 
 // Case-insensitive http:// https:// ftp:// at src[j]; returns the scheme
 // length (6, 7 or 8) or 0. Char-code compares, no string allocation.
@@ -1305,22 +1332,23 @@ function schemeLenAt(src, j) {
   return 0;
 }
 
-function scanTextRun(src, i) {
+function scanTextRun(src, i, simple) {
   const n = src.length;
   let j = i + 1;
   if (src[i] === '`' || src[i] === '~') {
     while (j < n && src[j] === src[i]) j++;
   }
-  TEXT_STOP.lastIndex = j;
-  let m = TEXT_STOP.exec(src);
+  const re = simple ? TEXT_STOP_SIMPLE : TEXT_STOP;
+  re.lastIndex = j;
+  let m = re.exec(src);
   // A mailto:/xmpp: stop right after a multi-character first chunk (a
   // backtick/tilde run) is not a stop: marked's mailto lookahead needs the
   // non-alphanumeric before it to be a character the text regex itself
   // consumes, and a run swallows it (`` ``mailto: `` stays text, only the
   // email inside linkifies). Skip such a match and keep scanning.
-  while (m !== null && m.index === j && j > i + 1 && (m[0] === 'mailto:' || m[0] === 'xmpp:')) {
-    TEXT_STOP.lastIndex = j + 1;
-    m = TEXT_STOP.exec(src);
+  while (m !== null && !simple && m.index === j && j > i + 1 && (m[0] === 'mailto:' || m[0] === 'xmpp:')) {
+    re.lastIndex = j + 1;
+    m = re.exec(src);
   }
   if (m === null) return n;
   return m.index;
@@ -1386,23 +1414,24 @@ function renderAutolink(auto, plain) {
 
 export function renderInline(src, links, state, plain) {
   const n = src.length;
+  // The masked source and the last-closer scan are only read by emphasis /
+  // strikethrough, so they are built once up front when the run has any
+  // delimiter, and skipped entirely otherwise. Building them here (rather
+  // than lazily behind a closure) keeps the hot loop free of getter calls.
+  // The mask only changes the string where a code span, link, html tag or
+  // escape hides a delimiter; a run with none of those is its own mask.
+  const hasDelim = src.includes('*') || src.includes('_') || src.includes('~');
+  // Whether any autolink could start in this run (www., a scheme, an email,
+  // mailto:/xmpp:). Decides which text-stop scan the loop uses.
+  const hasUrl = src.includes('www.') || src.includes('://') || src.includes('@') || src.includes('mailto:') || src.includes('xmpp:');
   let masked = null;
   let lastClosers = null;
-  const getMasked = () => {
-    if (masked === null) {
-      // The mask only changes the string where a code span, link, html tag
-      // or escape hides a delimiter; a run with none of those is already
-      // its own mask.
-      masked = (src.includes('[') || src.includes('`') || src.includes('<') || src.includes('\\'))
-        ? maskSrc(src, links)
-        : src;
-    }
-    return masked;
-  };
-  const getLastClosers = () => {
-    if (lastClosers === null) lastClosers = scanLastClosers(getMasked());
-    return lastClosers;
-  };
+  if (hasDelim) {
+    masked = (src.includes('[') || src.includes('`') || src.includes('<') || src.includes('\\'))
+      ? maskSrc(src, links)
+      : src;
+    lastClosers = scanLastClosers(masked);
+  }
   let out = '';
   let i = 0;
   let prevChar = '';
@@ -1413,7 +1442,7 @@ export function renderInline(src, links, state, plain) {
     const ch = src[i];
 
     // escape: backslash + ASCII punctuation
-    if (ch === '\\' && i + 1 < n && ASCII_PUNCT_ESCAPE.has(src[i + 1])) {
+    if (ch === '\\' && i + 1 < n && src.charCodeAt(i + 1) < 128 && PUNCT_TABLE[src.charCodeAt(i + 1)] === 1) {
       const c = src[i + 1];
       out += plain ? c : escapeHtmlEntities(c);
       i += 2;
@@ -1471,7 +1500,7 @@ export function renderInline(src, links, state, plain) {
 
     // emphasis / strong
     if (ch === '*' || ch === '_') {
-      const em = tryEmStrong(src, i, getMasked(), getLastClosers(), prevChar);
+      const em = tryEmStrong(src, i, masked, lastClosers, prevChar);
       if (em) {
         const inner = renderInline(em.inner, links, state, plain);
         out += plain ? inner : '<' + em.tag + '>' + inner + '</' + em.tag + '>';
@@ -1502,7 +1531,7 @@ export function renderInline(src, links, state, plain) {
 
     // strikethrough
     if (ch === '~') {
-      const del = tryDel(src, i, getMasked(), getLastClosers(), prevChar);
+      const del = tryDel(src, i, masked, lastClosers, prevChar);
       if (del) {
         const inner = renderInline(del.inner, links, state, plain);
         out += plain ? inner : '<del>' + inner + '</del>';
@@ -1523,14 +1552,17 @@ export function renderInline(src, links, state, plain) {
     }
 
     // text run
-    const end = scanTextRun(src, i);
+    // Text runs use the simple stop scan when the run holds no url
+    // indicator; the full scan (with autolink lookaheads) only where a url
+    // could actually start.
+    const end = scanTextRun(src, i, !hasUrl);
     const run = src.slice(i, end);
     if (state.inRawBlock) {
       out += run;
     } else if (plain) {
       out += decodeNumericCharacterReferences(run);
     } else {
-      out += escapeHtmlEntities(decodeNumericCharacterReferences(run));
+      out += escapeTextRun(run);
     }
     if (run.charAt(run.length - 1) !== '_') prevChar = run.charAt(run.length - 1);
     keepPrevChar = true;
