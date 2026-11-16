@@ -41,7 +41,9 @@ export function parse(markdown) {
 }
 
 function fastParse(markdown) {
-  const src = markdown.replace(/\r\n|\r/g, '\n');
+  // Most inputs have no carriage returns; skip the (allocating) replace
+  // when there is nothing to normalize.
+  const src = markdown.includes('\r') ? markdown.replace(/\r\n|\r/g, '\n') : markdown;
   const lexer = new Lexer(defaults);
   const tokens = lexer.blockTokens(src, lexer.tokens);
   const links = lexer.tokens.links;
@@ -76,9 +78,16 @@ function inlineOf(token, inlineHtml) {
   return out;
 }
 
+// First whitespace in a code fence's info string: marked takes /^\S*/.
+const LANG_WS = /\s/;
+
 function renderCode(token) {
-  const langString = (token.lang || '').match(/^\S*/)?.[0];
-  const code = token.text ? token.text.replace(/\n$/, '') + '\n' : '';
+  const lang = token.lang || '';
+  const ws = lang.search(LANG_WS);
+  const langString = ws === -1 ? lang : lang.slice(0, ws);
+  // marked: token.text.replace(/\n$/, '') + '\n' — identical without the
+  // regex when the text already ends (or does not end) with a newline.
+  const code = token.text ? (token.text.endsWith('\n') ? token.text : token.text + '\n') : '';
   const escaped = token.escaped ? code : escapeHtmlEntities(code, true);
   if (!langString) return '<pre><code>' + escaped + '</code></pre>\n';
   return '<pre><code class="language-' + escapeHtmlEntities(langString) + '">' + escaped + '</code></pre>\n';

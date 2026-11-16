@@ -67,11 +67,17 @@ const ESCAPE_REPLACE = /[&<>"']/g;
 const ESCAPE_TEST_NO_ENCODE = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/;
 const ESCAPE_REPLACE_NO_ENCODE = /[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 
+// Module-level replace callbacks: passing a named function avoids
+// allocating a fresh closure on every escape/replace call.
+function escapeMapReplacer(ch) {
+  return ESCAPE_MAP[ch];
+}
+
 export function escapeHtmlEntities(html, encode) {
   if (encode) {
-    if (ESCAPE_TEST.test(html)) return html.replace(ESCAPE_REPLACE, (ch) => ESCAPE_MAP[ch]);
+    if (ESCAPE_TEST.test(html)) return html.replace(ESCAPE_REPLACE, escapeMapReplacer);
   } else {
-    if (ESCAPE_TEST_NO_ENCODE.test(html)) return html.replace(ESCAPE_REPLACE_NO_ENCODE, (ch) => ESCAPE_MAP[ch]);
+    if (ESCAPE_TEST_NO_ENCODE.test(html)) return html.replace(ESCAPE_REPLACE_NO_ENCODE, escapeMapReplacer);
   }
   return html;
 }
@@ -83,36 +89,41 @@ export function escapeHtmlEntities(html, encode) {
 // as the two-pass pipeline does.
 const TEXT_ESCAPE = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|[<>"']|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 const TEXT_ESCAPE_TEST = /[&<>"']/;
+
+function textEscapeReplacer(ref, dec, hex) {
+  if (dec === undefined && hex === undefined) {
+    if (ref === '&') return '&amp;';
+    return ESCAPE_MAP[ref];
+  }
+  const code = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
+  if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\uFFFD';
+  if (code === 38) return '&amp;';
+  if (code === 60) return '&lt;';
+  if (code === 62) return '&gt;';
+  if (code === 34) return '&quot;';
+  if (code === 39) return '&#39;';
+  return String.fromCodePoint(code);
+}
+
 export function escapeTextRun(text) {
   if (!TEXT_ESCAPE_TEST.test(text)) return text;
   TEXT_ESCAPE.lastIndex = 0;
-  return text.replace(TEXT_ESCAPE, (ref, dec, hex) => {
-    if (dec === undefined && hex === undefined) {
-      if (ref === '&') return '&amp;';
-      return ESCAPE_MAP[ref];
-    }
-    const code = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
-    if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\uFFFD';
-    if (code === 38) return '&amp;';
-    if (code === 60) return '&lt;';
-    if (code === 62) return '&gt;';
-    if (code === 34) return '&quot;';
-    if (code === 39) return '&#39;';
-    return String.fromCodePoint(code);
-  });
+  return text.replace(TEXT_ESCAPE, textEscapeReplacer);
 }
 
 const NUMERIC_REF_TEST = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));/;
 const NUMERIC_REF_OR_AMP = /&#(?:(\d{1,7})|[Xx]([A-Fa-f0-9]{1,6}));|&(?!(#\d{1,7}|#[Xx][a-fA-F0-9]{1,6}|\w+);)/g;
 
+function numericRefReplacer(ref, dec, hex) {
+  if (dec === undefined && hex === undefined) return '&amp;';
+  const code = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
+  if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\uFFFD';
+  return code === 38 ? '&amp;' : String.fromCodePoint(code);
+}
+
 export function decodeNumericCharacterReferences(text) {
   if (!NUMERIC_REF_TEST.test(text)) return text;
-  return text.replace(NUMERIC_REF_OR_AMP, (ref, dec, hex) => {
-    if (dec === undefined && hex === undefined) return '&amp;';
-    const code = dec === undefined ? parseInt(hex, 16) : parseInt(dec, 10);
-    if (code === 0 || code > 0x10ffff || (code >= 0xd800 && code <= 0xdfff)) return '\uFFFD';
-    return code === 38 ? '&amp;' : String.fromCodePoint(code);
-  });
+  return text.replace(NUMERIC_REF_OR_AMP, numericRefReplacer);
 }
 
 const PERCENT_DECODE = /%25/g;
@@ -171,6 +182,8 @@ function unescapePunct(text) {
 // Code spans. Returns {end, text} or null.
 // ---------------------------------------------------------------------------
 
+const NON_SPACE = /[^ ]/;
+
 export function scanCodespan(src, i) {
   // count the opening backtick run
   let k = 0;
@@ -184,7 +197,7 @@ export function scanCodespan(src, i) {
     while (j + m < src.length && src[j + m] === '`') m++;
     if (m === k && j > i + k) {
       let text = src.slice(i + k, j).replace(/\n/g, ' ');
-      if (/[^ ]/.test(text) && text.charAt(0) === ' ' && text.charAt(text.length - 1) === ' ') {
+      if (NON_SPACE.test(text) && text.charAt(0) === ' ' && text.charAt(text.length - 1) === ' ') {
         text = text.substring(1, text.length - 1);
       }
       return { end: j + m, text };
@@ -400,6 +413,7 @@ function scanExtEmailDomain(src, i) {
   if (j >= n || !isUrlDomainChar(src[j]) && src[j] !== '_') return -1;
   while (j < n && (isUrlDomainChar(src[j]) || src[j] === '_')) j++;
   let groups = 0;
+  let lastGroupStart = -1;
   while (src[j] === '.') {
     let k = j + 1;
     const start = k;
@@ -409,14 +423,22 @@ function scanExtEmailDomain(src, i) {
     let end = k;
     while (end > start && !((src[end - 1] >= 'a' && src[end - 1] <= 'z') || (src[end - 1] >= 'A' && src[end - 1] <= 'Z') || (src[end - 1] >= '0' && src[end - 1] <= '9'))) end--;
     if (end === start) break;
+    lastGroupStart = j;
     j = end;
     groups++;
   }
   if (groups === 0) return -1;
-  // (?![\w-]) — \w is ASCII-only [A-Za-z0-9_], not Unicode word chars
+  // (?![\w-]) — \w is ASCII-only [A-Za-z0-9_], not Unicode word chars.
+  // marked's regex backtracks here: if the character after the domain is
+  // a word char or '-', the last ".label" group is dropped (the character
+  // after the shorter domain is then '.', which always passes). Shrinking
+  // the last label instead never helps — it only exposes another word char.
   if (j < n) {
     const c = src[j];
-    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '_' || c === '-') return -1;
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '_' || c === '-') {
+      if (groups < 2) return -1;
+      return lastGroupStart;
+    }
   }
   return j;
 }
@@ -444,8 +466,12 @@ export function scanUrl(src, i) {
         while (k < n && ((src[k] >= 'a' && src[k] <= 'z') || (src[k] >= 'A' && src[k] <= 'Z') || (src[k] >= '0' && src[k] <= '9') || src[k] === '@' || src[k] === '.')) k++;
         if (k > e + 1) e = k;
       }
-      const text = src.slice(i, e);
-      return { end: e, text, href: text };
+      // marked backpedals every extended autolink except a plain email:
+      // the xmpp resource may end in '.', which is trimmed (a mailto:
+      // address always ends in an alnum, so this is a no-op there).
+      const text = backpedal(src.slice(i, e));
+      if (!text) return null;
+      return { end: i + text.length, text, href: text };
     }
   }
   // scheme:// (case-insensitive) or www. (lowercase only) + domain labels
@@ -922,8 +948,13 @@ const MASK_NEXT = /[\\`\[<]/g;
 
 export function maskSrc(src, links) {
   let masked = src;
-  // Step 1: mask reflinks (only when definitions exist)
-  if (links && Object.keys(links).length > 0 && src.includes('[')) {
+  // Step 1: mask reflinks (only when definitions exist). The for-in probe
+  // checks for any definition without allocating Object.keys()' array.
+  let hasLinks = false;
+  if (links) {
+    for (const _k in links) { hasLinks = true; break; }
+  }
+  if (hasLinks && src.includes('[')) {
     let out = '';
     let i = 0;
     while (i < masked.length) {
@@ -1095,8 +1126,11 @@ function isFlankPunct(ch) {
 
 // Classify a delimiter run [rs, re) in the masked source: 'left' (can only
 // open), 'right' (can only close), 'either', or null (neither). gfm=true
-// for `*`/`_` (where `~` is not punctuation), false for `~`. Note `_` has
-// no group 6: a run between two alphanumerics can neither open nor close.
+// for `*` (where `~` is not punctuation), false for `_` and `~`: marked's
+// GFM `_` closer regex is the non-GFM one, so `~` counts as punctuation
+// there — `_b_~` closes, while `_a_b_c` (alphanumeric on both sides) does
+// not. Note `_` has no group 6: a run between two alphanumerics can neither
+// open nor close.
 function classifyDelim(masked, rs, re, gfm, delim) {
   const prev = rs > 0 ? masked[rs - 1] : '';
   const next = re < masked.length ? masked[re] : '';
@@ -1193,7 +1227,7 @@ function tryEmStrong(src, pos, masked, lastClosers, prevChar) {
       if (rs - 1 > lastPossible) return null;
       let re = rs;
       while (re < masked.length && masked[re] === delim) re++;
-      const cls = classifyDelim(masked, rs, re, true, delim);
+      const cls = classifyDelim(masked, rs, re, delim === '*', delim);
       scanPos = re;
       if (cls === null) continue;
       let rLength = re - rs;
