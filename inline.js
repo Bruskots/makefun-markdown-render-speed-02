@@ -387,8 +387,11 @@ function scanExtEmailDomain(src, i) {
     groups++;
   }
   if (groups === 0) return -1;
-  // (?![\w-])
-  if (j < n && (isWordChar(src[j]) || src[j] === '-')) return -1;
+  // (?![\w-]) — \w is ASCII-only [A-Za-z0-9_], not Unicode word chars
+  if (j < n) {
+    const c = src[j];
+    if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c === '_' || c === '-') return -1;
+  }
   return j;
 }
 
@@ -1140,7 +1143,10 @@ function tryEmStrong(src, pos, masked, lastClosers, prevChar) {
   const runPrevPunct = runPrevChar === '*' || runPrevChar === '_' || isFlankPunct(runPrevChar);
   let effPrevChar = prevChar;
   if (runStart < pos) effPrevChar = runPrevChar;
-  const prevPunct = isFlankPunct(effPrevChar);
+  // Marked's gate uses h (which counts * and _ as "punctuation") when the
+  // run extends back, and the punctuation test (which excludes * and _)
+  // when it does not.
+  const prevPunct = runStart < pos ? runPrevPunct : isFlankPunct(prevChar);
   if (delim === '_' && nextOther !== null && effPrevChar !== '' && isAlnum(effPrevChar)) return null;
   const nextChar = nextPunct || '';
   if (!nextChar || !effPrevChar || prevPunct) {
@@ -1282,7 +1288,7 @@ function scanBr(src, i) {
 // rule, via the lookbehind), a scheme, mailto:/xmpp: (after a non-alnum),
 // or an email address (at an email-character boundary). One C++ scan
 // replaces a per-character JavaScript loop.
-const TEXT_STOP = /[\\<!\[`*_~]| {2,}\n|(?<![^\s*_~(])www\.|[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|(?<![A-Za-z0-9])(?:mailto:|xmpp:)|(?<![A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-])[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@/g;
+const TEXT_STOP = /[\\<!\[`*_~]| {2,}\n|(?<![^\s*_~(])www\.|[hH][tT][tT][pP][sS]?:\/\/|[fF][tT][pP]:\/\/|(?<![A-Za-z0-9])(?:mailto:|xmpp:)|[A-Za-z0-9.!#$%&'*+\/=?^_`{|}~-]+@/g;
 
 // Case-insensitive http:// https:// ftp:// at src[j]; returns the scheme
 // length (6, 7 or 8) or 0. Char-code compares, no string allocation.
@@ -1306,7 +1312,16 @@ function scanTextRun(src, i) {
     while (j < n && src[j] === src[i]) j++;
   }
   TEXT_STOP.lastIndex = j;
-  const m = TEXT_STOP.exec(src);
+  let m = TEXT_STOP.exec(src);
+  // A mailto:/xmpp: stop right after a multi-character first chunk (a
+  // backtick/tilde run) is not a stop: marked's mailto lookahead needs the
+  // non-alphanumeric before it to be a character the text regex itself
+  // consumes, and a run swallows it (`` ``mailto: `` stays text, only the
+  // email inside linkifies). Skip such a match and keep scanning.
+  while (m !== null && m.index === j && j > i + 1 && (m[0] === 'mailto:' || m[0] === 'xmpp:')) {
+    TEXT_STOP.lastIndex = j + 1;
+    m = TEXT_STOP.exec(src);
+  }
   if (m === null) return n;
   return m.index;
 }
